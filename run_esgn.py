@@ -168,6 +168,25 @@ def cmd_brief(args):
     return 0
 
 
+def cmd_site(args):
+    from esgn import site
+
+    try:
+        path, count = site.build(
+            curated_root=args.curated_root, reports_dir=args.reports_dir,
+            out_dir=args.out,
+        )
+    except FileNotFoundError as exc:
+        print(f"\n{exc}\n")
+        return 1
+
+    size_kb = path.stat().st_size / 1024
+    print(f"\nSite built: {path}")
+    print(f"Articles: {count}  |  Size: {size_kb:.0f} KB (self-contained)")
+    print("Deploy the containing folder to any static host.")
+    return 0
+
+
 def cmd_feeds(args):
     print(f"\n{len(ALL_FEEDS)} registered feeds:\n")
     for feed in sorted(ALL_FEEDS, key=lambda f: (f["market"], f["id"])):
@@ -235,6 +254,12 @@ def main(argv=None):
     sp.add_argument("--out", default=None, help="Output .md path")
     sp.add_argument("--curated-root", default=None)
     sp.set_defaults(func=cmd_brief)
+
+    sp = sub.add_parser("site", help="Build the static dashboard site")
+    sp.add_argument("--out", default=None, help="Output dir (default: site/)")
+    sp.add_argument("--curated-root", default=None)
+    sp.add_argument("--reports-dir", default=None)
+    sp.set_defaults(func=cmd_site)
 
     sp = sub.add_parser("feeds", help="List the feed registry")
     sp.set_defaults(func=cmd_feeds)
