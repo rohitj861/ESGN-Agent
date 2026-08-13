@@ -6,6 +6,8 @@ deduplicates it, and writes a curated dataset.
 
 Source layer is RSS/Atom only — no API keys, no rate limits, no vendor cost.
 
+**Live dashboard:** https://esgn-agent.vercel.app
+
 ---
 
 ## Quick start
@@ -34,6 +36,7 @@ pip install -r requirements.txt   # optional: CSV/Parquet output, Spark, tests
 | `curate` | Transform raw → curated only (re-runnable offline) |
 | `validate` | Probe every feed, report reachability and item counts |
 | `digest` | Print the top-ranked stories from curated output |
+| `site` | Build the static dashboard (`site/index.html`) |
 | `feeds` | List the feed registry |
 
 Useful flags:
@@ -97,6 +100,27 @@ safety net, prints any failures and exits non-zero.
 
 Cost is negligible: ~6k tokens total across all calls, well under a cent per
 run on `gpt-4o-mini`.
+
+## Dashboard site
+
+```bash
+python run_esgn.py site      # writes site/index.html
+```
+
+One self-contained ~94 KB HTML file — no build step, no external assets, no
+runtime, no tracking. Two tabs: the rendered weekly briefing, and a browser
+over every curated article filterable by market, ESG pillar and source with
+full-text search and relevance/date sorting. Light and dark themes follow the
+viewer's system setting.
+
+Deployed to Vercel from this repo. `site/index.html` is **committed as a build
+artifact** rather than built on Vercel, because generating it requires the
+curated dataset in `data/`, which is gitignored. To refresh what's live:
+
+```bash
+python run_esgn.py run && python run_esgn.py brief && python run_esgn.py site
+git commit -am "Refresh dashboard" && git push    # Vercel redeploys on push
+```
 
 ## Architecture
 
