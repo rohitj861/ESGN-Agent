@@ -87,8 +87,70 @@ def load_curated(curated_root=None):
         return [json.loads(line) for line in fh if line.strip()]
 
 
-def select_top(rows, top_n=DEFAULT_TOP_N, markets=None):
-    """Highest-relevance articles, optionally restricted to given markets."""
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "for", "to", "of", "in", "on", "at",
+    "by", "with", "from", "as", "is", "are", "was", "were", "be", "been",
+    "its", "it", "this", "that", "these", "those", "new", "over", "more",
+    "after", "into", "amid", "says", "said", "will", "has", "have", "not",
+}
+_TOKEN_RE = re.compile(r"[a-z0-9$]+")
+
+# Measured against the live 108-article dataset rather than guessed. Every
+# candidate pair was inspected by hand:
+#
+#   lowest TRUE positive   0.400  Samsung/GM battery JV, same story two outlets
+#   highest FALSE positive 0.350  Essar $400M vs South Africa $500M, unrelated
+#
+# 0.375 is the midpoint of that gap. At this setting all seven genuine
+# syndication pairs in the dataset collapse and nothing distinct is merged.
+# Erring high is the safer failure: a missed duplicate is untidy, whereas a
+# false merge silently deletes a real story from the briefing.
+NEAR_DUPLICATE_THRESHOLD = 0.375
+
+
+def _signature(row):
+    """Significant tokens from the headline plus the opening of the summary."""
+    text = f"{row.get('title') or ''} {(row.get('summary') or '')[:200]}".lower()
+    tokens = {
+        t.rstrip("s") for t in _TOKEN_RE.findall(text)
+        if len(t) > 2 and t not in _STOPWORDS
+    }
+    return tokens
+
+
+def _is_near_duplicate(a, b, threshold=NEAR_DUPLICATE_THRESHOLD):
+    """Containment overlap, which handles headlines of very different length.
+
+    Jaccard fails here: "Climate Fund Managers Raises Over $180 Million to Back
+    Green Hydrogen Value Chain in Southern Africa" and "Climate Fund Managers
+    Raise $182M for SA-H2 Fund" are one event, but the longer headline dilutes
+    the union. Dividing by the smaller set measures whether the shorter story
+    is wholly contained in the longer one.
+    """
+    sa, sb = _signature(a), _signature(b)
+    if not sa or not sb:
+        return False
+    smaller = min(len(sa), len(sb))
+    return len(sa & sb) / smaller >= threshold
+
+
+def collapse_near_duplicates(rows, threshold=NEAR_DUPLICATE_THRESHOLD):
+    """Drop rows that retell a story already present earlier in the list.
+
+    Applied only when building the briefing -- the curated dataset keeps both,
+    since they genuinely are separate articles from separate publishers.
+    """
+    kept = []
+    for row in rows:
+        if any(_is_near_duplicate(row, seen, threshold) for seen in kept):
+            log.info("near-duplicate dropped: %s", (row.get("title") or "")[:70])
+            continue
+        kept.append(row)
+    return kept
+
+
+def select_top(rows, top_n=DEFAULT_TOP_N, markets=None, collapse=True):
+    """Highest-relevance, deduplicated articles for the briefing."""
     if markets:
         wanted = {m.upper() for m in markets}
         rows = [r for r in rows if wanted & set(r.get("markets") or [])]
@@ -97,7 +159,61 @@ def select_top(rows, top_n=DEFAULT_TOP_N, markets=None):
         key=lambda r: (-(r.get("relevance_score") or 0.0),
                        r.get("published_date") or ""),
     )
+    # Collapse before truncating, so a dropped duplicate is backfilled by the
+    # next distinct story rather than shrinking the briefing.
+    if collapse:
+        ranked = collapse_near_duplicates(ranked)
     return ranked[:top_n]
+
+
+# Capital-markets vocabulary. A story only lands in Sustainable Finance when
+# the money angle is the story, not merely mentioned.
+FINANCE_TERMS = [
+    "fund", "investor", "investment", "financing", "finance", "capital",
+    "bond", "raised", "raises", "billion", "million", "portfolio", "divest",
+    "issuance", "asset manager", "aum", "shareholder", "credit", "loan",
+    "underwriting", "insurer", "valuation", "carbon price", "carbon market",
+    "offset", "stake", "acquisition", "ipo", "equity", "debt",
+]
+
+_SECTION_BY_PILLAR = {"E": "Environment", "S": "Social", "G": "Governance"}
+
+# Topic tags carry signal the pillar keywords miss. "Norway Wealth Fund Opposes
+# SEC Climate Rule Repeal" matches one E keyword and one G keyword, so a raw
+# count files it under Environment -- yet it is plainly a disclosure-governance
+# story, which its topic tags already say. Regulation/policy is deliberately
+# absent: it is far too common to be discriminating.
+_TOPIC_PILLAR_BOOST = {
+    "reporting_disclosure": ("G", 2),
+    "litigation_enforcement": ("G", 2),
+    "greenwashing": ("G", 2),
+    "supply_chain": ("S", 2),
+}
+
+
+def _signal_strength(row):
+    """How strongly the article signals each pillar, and the money angle.
+
+    Routing on mere pillar *presence* misfiled stories badly: an article
+    matching 11 Environment keywords and a single Social one ("diversity")
+    was filed under Social purely because Social outranked Environment in a
+    fixed priority ladder. Counting matches routes on the dominant theme.
+    """
+    from .enrich import PILLAR_KEYWORDS, _haystack
+
+    text = _haystack(row)
+    pillars = {
+        pillar: sum(1 for kw in kws if kw in text)
+        for pillar, kws in PILLAR_KEYWORDS.items()
+    }
+
+    for topic in row.get("topics") or []:
+        boost = _TOPIC_PILLAR_BOOST.get(topic)
+        if boost:
+            pillars[boost[0]] = pillars.get(boost[0], 0) + boost[1]
+
+    finance = sum(1 for term in FINANCE_TERMS if term in text)
+    return pillars, finance
 
 
 def primary_section(row):
@@ -105,20 +221,24 @@ def primary_section(row):
 
     A story often carries several pillars -- a CSRD item is both Environment
     and Governance -- but a briefing that prints it twice reads as sloppy, so
-    each article gets exactly one home. Money first (that is what the
-    Sustainable Finance section exists for), then the rarer S/G signals, with
-    Environment as the default since nearly every ESG story carries an E.
+    each article gets exactly one home, chosen by strongest signal.
     """
-    pillars = set(row.get("esg_pillars") or [])
+    pillars, finance = _signal_strength(row)
     topics = set(row.get("topics") or [])
+    strongest = max(pillars.values()) if pillars else 0
 
-    if {"sustainable_finance", "carbon_markets"} & topics:
+    # Money has to be both flagged as the topic and lexically dominant.
+    if ({"sustainable_finance", "carbon_markets"} & topics
+            and finance >= 2 and finance >= strongest):
         return "Sustainable Finance"
-    if "G" in pillars:
-        return "Governance"
-    if "S" in pillars:
-        return "Social"
-    return "Environment"
+
+    if strongest == 0:
+        return "Environment"
+
+    # Ties break towards Environment, then Governance, then Social, matching
+    # how common each pillar actually is in ESG coverage.
+    best = max(pillars.items(), key=lambda kv: (kv[1], -"EGS".index(kv[0])))
+    return _SECTION_BY_PILLAR[best[0]]
 
 
 def group_by_section(rows):
@@ -180,15 +300,69 @@ Rules:
 - Plain language. Explain any acronym you use."""
 
 GLOSSARY_SPEC = """\
-Build the glossary for a weekly ESG briefing. Return STRICT JSON:
+Define each supplied term for a weekly ESG briefing. Return STRICT JSON:
 
 {"terms": [{"term": "CSRD", "meaning": "plain-language explanation"}]}
 
 Rules:
-- Include ONLY terms that actually appear in the briefing text supplied.
-- Explain each in one plain-language sentence for a financially literate
-  reader who is not a regulatory specialist.
-- Order alphabetically. Omit terms needing no explanation."""
+- Return one entry for EVERY term in the list, EXCEPT that you must OMIT any
+  term that is merely a company, brand or product name (a toy manufacturer, a
+  bank, an airline). Those need no explanation. Omit units and timezones too.
+- Do NOT add terms that are not on the list.
+- One plain-language sentence each, written for a financially literate reader
+  who is not a regulatory specialist. Expand the acronym, then say what it
+  does and who it applies to.
+- No marketing language. If a term is a standards body or initiative, say what
+  it is and what it does."""
+
+# Acronyms that need no explanation for this readership.
+_GLOSSARY_SKIP = {
+    "ESG", "EU", "US", "USA", "UK", "UN", "CEO", "CFO", "COO", "CIO", "IT",
+    "AI", "GDP", "PLC", "INC", "LTD", "LLC", "AGM", "Q1", "Q2", "Q3", "Q4",
+    "USD", "EUR", "GBP", "TV", "PDF", "FAQ", "RFP", "NGO", "SA", "H2",
+    "UTC", "GMT", "MW", "GW", "KW", "TWH", "CO2", "AM", "PM",
+}
+
+# Multi-word jargon that acronym scanning cannot catch.
+_GLOSSARY_PHRASES = [
+    "double materiality", "financed emissions", "transition finance",
+    "transition plan", "physical risk", "transition risk", "just transition",
+    "carbon credit", "carbon offset", "carbon intensity", "green bond",
+    "sustainability-linked", "green hydrogen", "green ammonia",
+    "carbon removal", "carbon capture", "net-zero", "science-based target",
+    "taxonomy", "stewardship", "greenwashing", "circular economy",
+]
+
+_ACRONYM_RE = re.compile(r"\b([A-Z]{2,6})\b")
+_SCOPE_RE = re.compile(r"\bScope\s*([123])\b", re.IGNORECASE)
+
+
+def extract_terms(body):
+    """Every term in the briefing that plausibly needs explaining.
+
+    Letting the model pick its own glossary produced two entries for a
+    briefing that used eight pieces of jargon, and it also invented entries
+    for terms the text never used. Detecting them here makes coverage
+    deterministic; the model is left to write definitions only.
+    """
+    terms = set()
+
+    for match in _ACRONYM_RE.finditer(body):
+        token = match.group(1)
+        if token not in _GLOSSARY_SKIP:
+            terms.add(token)
+
+    lowered = body.lower()
+    for phrase in _GLOSSARY_PHRASES:
+        if phrase in lowered:
+            terms.add(phrase)
+
+    scopes = sorted({m.group(1) for m in _SCOPE_RE.finditer(body)})
+    if scopes:
+        terms.add("Scope " + " and ".join(scopes) + " emissions"
+                  if len(scopes) > 1 else f"Scope {scopes[0]} emissions")
+
+    return sorted(terms, key=str.lower)
 
 
 def missing_articles(markdown, rows):
@@ -295,18 +469,36 @@ def write_executive_summary(client, model, rows, temperature):
 
 
 def write_glossary(client, model, body, temperature):
+    """Define every jargon term the briefing actually uses."""
+    wanted = extract_terms(body)
+    if not wanted:
+        return []
+
+    log.info("glossary: defining %d detected terms", len(wanted))
     data, _ = _json_call(
         client, model, SYSTEM_PROMPT,
-        f"{GLOSSARY_SPEC}\n\n--- BRIEFING TEXT ---\n\n{body[:12000]}",
+        f"{GLOSSARY_SPEC}\n\n--- TERMS TO DEFINE ---\n"
+        + "\n".join(f"- {t}" for t in wanted)
+        + f"\n\n--- CONTEXT (the briefing they appear in) ---\n\n{body[:9000]}",
         temperature,
     )
-    terms = []
+
+    defined = {}
     for item in data.get("terms", []):
         term = str(item.get("term", "")).strip()
         meaning = str(item.get("meaning", "")).strip().rstrip(".")
         if term and meaning:
-            terms.append((term, meaning))
-    return sorted(set(terms))
+            defined[term.lower()] = (term, meaning)
+
+    # Omissions are expected: the model is asked to drop brand names it was
+    # handed, since acronym scanning cannot tell "PCAF" from "LEGO".
+    skipped = [t for t in wanted if t.lower() not in defined]
+    if skipped:
+        log.info("glossary: %d term(s) judged not jargon: %s",
+                 len(skipped), ", ".join(skipped))
+
+    # Preserve detection order, and keep only what was actually asked for.
+    return [defined[t.lower()] for t in wanted if t.lower() in defined]
 
 
 def _story_markdown(row, analysis):

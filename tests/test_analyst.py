@@ -76,15 +76,130 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(len(placed), len(ROWS),
                          "an article must not appear in two sections")
 
-    def test_section_routing(self):
-        # Finance topic wins over pillars; otherwise G, then S, then E.
-        self.assertEqual(analyst.primary_section(ROWS[1]), "Sustainable Finance")
-        self.assertEqual(analyst.primary_section(ROWS[0]), "Governance")
-        self.assertEqual(analyst.primary_section(ROWS[2]), "Social")
-        self.assertEqual(
-            analyst.primary_section({"esg_pillars": ["E"], "topics": []}),
-            "Environment",
-        )
+    def test_routing_follows_dominant_signal_not_priority(self):
+        """Regression: real stories misfiled by the old priority ladder.
+
+        A story matching many Environment keywords and a single Social or
+        Governance one belongs in Environment, whatever the pillar order.
+        """
+        housing = {
+            "title": "Platform Housing Group unveils roadmap to 2050 net-zero",
+            "summary": "Roadmap covers greenhouse gas emissions, Scope 1 and 2, "
+                       "renewable heat and climate targets across its housing "
+                       "stock, with a diversity commitment noted.",
+            "categories": [], "esg_pillars": ["E", "S"],
+            "topics": ["energy_transition"],
+        }
+        self.assertEqual(analyst.primary_section(housing), "Environment")
+
+        study = {
+            "title": "Fossil fuel gains outweigh AI climate benefits, study finds",
+            "summary": "Carbon emission and renewable energy analysis exposes a "
+                       "climate disclosure blind spot in decarbonisation claims.",
+            "categories": [], "esg_pillars": ["E", "G"],
+            "topics": ["energy_transition"],
+        }
+        self.assertEqual(analyst.primary_section(study), "Environment")
+
+    def test_topic_tags_rescue_weak_governance_signal(self):
+        """Regression: a disclosure story with only one G keyword."""
+        norway = {
+            "title": "Norway Wealth Fund Opposes SEC Climate Rule Repeal",
+            "summary": "The fund backs mandatory disclosure for listed companies.",
+            "categories": [], "esg_pillars": ["E", "G"],
+            "topics": ["reporting_disclosure", "regulation_policy"],
+        }
+        self.assertEqual(analyst.primary_section(norway), "Governance")
+
+    def test_finance_needs_topic_and_lexical_dominance(self):
+        funded = {
+            "title": "Climate Fund Managers raises $180 million for green hydrogen",
+            "summary": "The fund secured investment commitments from investors, "
+                       "with capital raised backing the financing of new assets.",
+            "categories": [], "esg_pillars": ["E"],
+            "topics": ["sustainable_finance"],
+        }
+        self.assertEqual(analyst.primary_section(funded), "Sustainable Finance")
+
+        # A climate story that merely mentions money stays in Environment.
+        passing = {
+            "title": "Country targets 1 million tons of green ammonia",
+            "summary": "Plan cuts emissions from fertiliser production and "
+                       "reduces reliance on imported fossil fuel.",
+            "categories": [], "esg_pillars": ["E"], "topics": ["energy_transition"],
+        }
+        self.assertEqual(analyst.primary_section(passing), "Environment")
+
+
+class TestNearDuplicates(unittest.TestCase):
+    """Thresholds here were measured against the live dataset, not guessed."""
+
+    A = {"title": "Climate Fund Managers Raises Over $180 Million to Back Green "
+                  "Hydrogen Value Chain in Southern Africa",
+         "summary": "Climate Fund Managers reached first close of its SA-H2 fund "
+                    "backing the green hydrogen economy in Southern Africa."}
+    B = {"title": "Climate Fund Managers Raise $182M for SA-H2 Fund",
+         "summary": "Climate Fund Managers announced first close of the SA-H2 "
+                    "fund, investing in Southern Africa green hydrogen."}
+    C = {"title": "Essar Energy Transition Secures $400 Million Financing",
+         "summary": "Essar secured financing from European and UK banks to "
+                    "support liquidity in volatile energy markets."}
+    D = {"title": "South Africa Secures $500M for Climate Resilient Cities",
+         "summary": "Funding supports climate resilient urban infrastructure "
+                    "across South African cities."}
+
+    def test_syndicated_pair_collapses(self):
+        self.assertTrue(analyst._is_near_duplicate(self.A, self.B))
+
+    def test_distinct_funding_stories_not_merged(self):
+        """Both are '$Xm secured' stories; merging them would delete news."""
+        self.assertFalse(analyst._is_near_duplicate(self.C, self.D))
+
+    def test_collapse_keeps_first_and_drops_retelling(self):
+        kept = analyst.collapse_near_duplicates([self.A, self.B, self.C])
+        titles = [r["title"] for r in kept]
+        self.assertEqual(len(kept), 2)
+        self.assertIn(self.A["title"], titles)
+        self.assertNotIn(self.B["title"], titles)
+
+    def test_collapse_happens_before_truncation(self):
+        """A dropped duplicate must be backfilled, not shrink the briefing."""
+        rows = [dict(r, relevance_score=s, markets=["EU"], published_date="2026-08-13")
+                for r, s in [(self.A, 0.9), (self.B, 0.8), (self.C, 0.7), (self.D, 0.6)]]
+        out = analyst.select_top(rows, top_n=3)
+        self.assertEqual(len(out), 3, "should backfill after dropping the dupe")
+        self.assertNotIn(self.B["title"], [r["title"] for r in out])
+
+
+class TestGlossaryExtraction(unittest.TestCase):
+    BODY = ("The CSRD and SFDR apply in the EU and the US. PCAF and CORSIA "
+            "matter for financed emissions and carbon credit markets. "
+            "Scope 1 and Scope 2 emissions fell. Generated 22:23 UTC. "
+            "LEGO expanded green hydrogen use under a net-zero plan.")
+
+    def test_detects_regulatory_acronyms(self):
+        terms = analyst.extract_terms(self.BODY)
+        for expected in ("CSRD", "SFDR", "PCAF", "CORSIA"):
+            self.assertIn(expected, terms)
+
+    def test_detects_multiword_jargon(self):
+        terms = analyst.extract_terms(self.BODY)
+        for expected in ("financed emissions", "carbon credit",
+                         "green hydrogen", "net-zero"):
+            self.assertIn(expected, terms)
+
+    def test_scope_emissions_collapsed_to_one_entry(self):
+        terms = analyst.extract_terms(self.BODY)
+        self.assertIn("Scope 1 and 2 emissions", terms)
+
+    def test_skips_obvious_non_jargon(self):
+        terms = analyst.extract_terms(self.BODY)
+        for skipped in ("EU", "US", "UTC"):
+            self.assertNotIn(skipped, terms)
+
+    def test_brand_names_are_surfaced_for_the_model_to_reject(self):
+        """Acronym scanning cannot tell PCAF from LEGO; the model filters."""
+        self.assertIn("LEGO", analyst.extract_terms(self.BODY))
 
 
 class TestAssembly(unittest.TestCase):
