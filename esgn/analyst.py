@@ -261,9 +261,14 @@ financially literate but are NOT regulatory specialists, so every piece of \
 jargon must be explained in plain language the first time it appears.
 
 Write in precise, neutral, factual prose. No marketing language, no hype, no \
-filler. Never invent facts, figures, dates or URLs: use only what the source \
-data provides. If something is unclear from the source material, say so \
-rather than guessing."""
+filler.
+
+Never invent facts, figures, dates, companies or URLs: those come only from \
+the source data. Analysis is different -- assessing why a development matters, \
+who it exposes and what follows next is the job you are being paid for, and \
+you must always offer that judgement even when the source is a single \
+headline. Keep such claims proportionate to the evidence rather than \
+declining to make them."""
 
 BATCH_SIZE = 5
 
@@ -279,8 +284,13 @@ investment desk needs. Return STRICT JSON, no prose outside it:
 
 Rules:
 - Return one object for EVERY article you were given. Never skip one.
-- Base every statement on the supplied article data. Do not invent figures,
-  dates or events. If the source is thin, say what is known and no more.
+- Distinguish facts from analysis. "what_happened" is reporting: never invent
+  figures, dates, companies or events beyond the supplied data. The other
+  three fields are your professional judgement, and you must always provide
+  them -- significance, exposure and next milestones are inferred from the
+  development plus general ESG knowledge, so "not stated in the source" is
+  never an acceptable answer there. Where the source is thin, reason from
+  what the development itself implies and keep the claim suitably general.
 - Explain jargon in plain language in parentheses at first use, e.g. "CSRD
   (the EU rule requiring large companies to publish audited sustainability
   reports)".
@@ -628,6 +638,20 @@ def validate_briefing(markdown, rows):
 
     if "## Terms Explained" not in markdown:
         problems.append("missing '## Terms Explained' glossary")
+
+    # The analytical fields are judgement calls, so declining to answer is a
+    # defect rather than caution. Only flag it on those three headings --
+    # "what happened" legitimately has nothing to add sometimes.
+    declined = len(re.findall(
+        r"\*\*(?:Why it matters|Who may be affected|What to watch next)\*\*\s*-\s*"
+        r"(?:not stated|not specified|unclear|unknown|n/a)",
+        markdown, re.IGNORECASE,
+    ))
+    if declined:
+        problems.append(
+            f"{declined} analytical field(s) declined to answer "
+            f"('not stated in the source material')"
+        )
 
     return problems
 
