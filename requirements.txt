@@ -1,0 +1,21 @@
+# --- Core pipeline: NO dependencies required ---------------------------------
+# esgn/fetch.py, enrich.py, local_job.py and pipeline.py run on a bare CPython
+# install using only the standard library (urllib + xml.etree + email.utils).
+# Everything below is optional and unlocks extra capability.
+
+# Optional: connection pooling + friendlier HTTP errors during fetch.
+requests>=2.31.0
+
+# Optional: CSV / Parquet output from the local (non-Spark) engine.
+pandas>=2.0.0
+pyarrow>=14.0.0
+
+# Optional: distributed transform engine.
+# NOTE: PySpark also needs a JVM (JDK 17 or 21) on PATH or at JAVA_HOME.
+# Without one, `--engine auto` silently falls back to the local engine.
+# PySpark officially supports Python 3.9-3.13; 4.2.0 installs on 3.14 but that
+# combination is not vendor-tested.
+pyspark>=4.0.0
+
+# Optional: test runner (the suite also runs under stdlib unittest).
+pytest>=8.0.0

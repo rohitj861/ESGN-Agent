@@ -1,0 +1,25 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Pipeline output
+data/
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Spec screenshots (local only)
+*.jpg
+*.jpeg
+*.png
